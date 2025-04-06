@@ -1,0 +1,24 @@
+{
+  "mlx_settings": {
+    "request_options": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 40,
+      "max_tokens": 2048
+    }
+  },
+  "script_settings": {
+    "batch_size": 10,
+    "retry_attempts": 3,
+    "timeout": 120
+  },
+  "input_format": {
+    "required_fields": ["id", "role", "text"]
+  },
+  "output_format": {
+    "fields": ["id", "role", "text"]
+  },
+  "multi_turn_conversation": {
+    "enabled": false
+  }
+}
