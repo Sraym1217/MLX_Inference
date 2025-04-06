@@ -4,12 +4,14 @@ import json
 import os
 import time
 import sys
+import shutil
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
+from pathlib import Path
 
 
 class MLXProcessor:
-    """MLXを使ってLLMを処理するクラス"""
+    """MLXを使ってLLMを処理するクラス (Hugging Face形式モデル対応)"""
     
     def __init__(self, config_path="template_config.json"):
         """初期化"""
@@ -38,6 +40,9 @@ class MLXProcessor:
         self.model = None
         self.tokenizer = None
         self.current_model_name = None
+        
+        # 一時ディレクトリ
+        self.temp_dir = Path("./mlx_temp_models")
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """設定ファイルを読み込む"""
@@ -58,7 +63,8 @@ class MLXProcessor:
                 "script_settings": {
                     "batch_size": 10,
                     "retry_attempts": 3,
-                    "timeout": 120
+                    "timeout": 120,
+                    "keep_converted_models": False
                 },
                 "input_format": {
                     "required_fields": ["id", "role", "text"]
@@ -119,6 +125,192 @@ class MLXProcessor:
         
         return True
     
+    def _is_mlx_format(self, model_path: str) -> bool:
+        """モデルがMLX-LM形式かどうかを判定する"""
+        model_dir = Path(model_path)
+        
+        # ローカルパスでない場合はHugging Faceリポジトリとみなす
+        if not model_dir.exists():
+            # HFのリポジトリ形式（'username/repo'）であればそのまま使用する場合もある
+            return False
+        
+        # MLX-LM形式の特徴的なファイルがあるか確認
+        mlx_indicators = [
+            model_dir / "weights.safetensors",
+            model_dir / "mlx_model.py",
+            model_dir / "config.json"
+        ]
+        
+        # どれか一つでも存在すればMLX-LM形式と判断
+        for indicator in mlx_indicators:
+            if indicator.exists():
+                return True
+                
+        return False
+    
+    def _prompt_quantization_options(self) -> Dict[str, Any]:
+        """量子化オプションを対話的に選択するプロンプトを表示する"""
+        print("\n==== Hugging Face → MLX-LM 変換オプション ====")
+        print("モデルの量子化設定を選択してください:")
+        print("1) 量子化なし")
+        print("2) 標準4ビット量子化")
+        print("3) 混合2/6ビット量子化 (mixed_2_6)")
+        print("4) 混合3/6ビット量子化 (mixed_3_6)")
+        print("5) カスタム量子化 (ビット数を指定)")
+        
+        choice = None
+        while choice not in ["1", "2", "3", "4", "5"]:
+            choice = input("選択肢を入力してください (1-5): ").strip()
+        
+        quant_options = {}
+        
+        if choice == "1":
+            # 量子化なし
+            quant_options["quantize"] = False
+        elif choice == "2":
+            # 標準4bit量子化
+            quant_options["quantize"] = True
+            quant_options["q_bits"] = 4
+            quant_options["q_group_size"] = 64
+            quant_options["quant_predicate"] = None
+        elif choice == "3":
+            # 混合2/6ビット量子化
+            quant_options["quantize"] = True
+            quant_options["quant_predicate"] = "mixed_2_6"
+        elif choice == "4":
+            # 混合3/6ビット量子化
+            quant_options["quantize"] = True
+            quant_options["quant_predicate"] = "mixed_3_6"
+        elif choice == "5":
+            # カスタム量子化
+            quant_options["quantize"] = True
+            
+            # ビット数を入力
+            q_bits = None
+            while q_bits is None:
+                try:
+                    q_bits = int(input("量子化ビット数を入力してください (2-8): ").strip())
+                    if q_bits < 2 or q_bits > 8:
+                        print("ビット数は2〜8の範囲で指定してください。")
+                        q_bits = None
+                except ValueError:
+                    print("有効な数値を入力してください。")
+            
+            # グループサイズを入力
+            q_group_size = None
+            while q_group_size is None:
+                try:
+                    q_group_size = int(input("量子化グループサイズを入力してください (推奨: 64): ").strip() or "64")
+                    if q_group_size <= 0:
+                        print("グループサイズは正の整数で指定してください。")
+                        q_group_size = None
+                except ValueError:
+                    print("有効な数値を入力してください。")
+            
+            quant_options["q_bits"] = q_bits
+            quant_options["q_group_size"] = q_group_size
+            quant_options["quant_predicate"] = None
+        
+        # データ型の選択
+        print("\nモデルのデータ型を選択してください:")
+        print("1) float16 (推奨)")
+        print("2) bfloat16")
+        print("3) float32")
+        
+        dtype_choice = None
+        while dtype_choice not in ["1", "2", "3"]:
+            dtype_choice = input("選択肢を入力してください (1-3): ").strip() or "1"
+        
+        if dtype_choice == "1":
+            quant_options["dtype"] = "float16"
+        elif dtype_choice == "2":
+            quant_options["dtype"] = "bfloat16"
+        else:
+            quant_options["dtype"] = "float32"
+        
+        return quant_options
+    
+    def _convert_hf_to_mlx(self, hf_path: str, quant_options: Dict[str, Any] = None) -> str:
+        """Hugging Faceモデルを変換してMLX-LM形式にする"""
+        # 変換オプションがない場合は対話的に選択
+        if quant_options is None:
+            quant_options = self._prompt_quantization_options()
+        
+        try:
+            # 一時ディレクトリを準備
+            self.temp_dir.mkdir(exist_ok=True)
+            
+            # 一意なディレクトリ名を生成
+            import hashlib
+            import datetime
+            
+            hash_str = hashlib.md5(f"{hf_path}_{datetime.datetime.now()}".encode()).hexdigest()[:8]
+            model_name = Path(hf_path).name if "/" not in hf_path else hf_path.split("/")[-1]
+            mlx_output_dir = self.temp_dir / f"{model_name}_{hash_str}"
+            
+            print(f"\n[INFO] Hugging Faceモデル '{hf_path}' をMLX-LM形式に変換しています...")
+            print(f"[INFO] 変換後のモデルパス: {mlx_output_dir}")
+            
+            # 変換コードをインポート
+            try:
+                # mlx_lm/convert.pyからインポートを試みる
+                try:
+                    from mlx_lm.convert import convert, QUANT_RECIPES
+                except ImportError:
+                    # 直接インポートできない場合は、既存のconvert.pyを使用
+                    print("[INFO] mlx_lmから直接convertモジュールをインポートできません。")
+                    print("[INFO] 代替方法でconvert関数をロードします...")
+                    
+                    # convert.pyが存在するか確認
+                    convert_py_path = Path("convert.py")
+                    if not convert_py_path.exists():
+                        raise ImportError("convert.pyファイルが見つかりません。")
+                    
+                    # 一時的にsysパスに追加
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("convert_module", convert_py_path)
+                    convert_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(convert_module)
+                    
+                    # 関数をインポート
+                    convert = convert_module.convert
+                    QUANT_RECIPES = convert_module.QUANT_RECIPES
+                
+                # 変換オプションを準備
+                convert_args = {
+                    "hf_path": hf_path,
+                    "mlx_path": str(mlx_output_dir),
+                    "dtype": quant_options.get("dtype", "float16"),
+                }
+                
+                # 量子化オプションを追加
+                if quant_options.get("quantize", False):
+                    print("[INFO] 量子化オプションを適用します...")
+                    convert_args["quantize"] = True
+                    convert_args["q_group_size"] = quant_options.get("q_group_size", 64)
+                    convert_args["q_bits"] = quant_options.get("q_bits", 4)
+                    
+                    # 量子化レシピを処理
+                    predicate_name = quant_options.get("quant_predicate")
+                    if predicate_name and predicate_name in QUANT_RECIPES:
+                        convert_args["quant_predicate"] = QUANT_RECIPES[predicate_name]
+                    
+                # モデルを変換
+                convert(**convert_args)
+                
+                print(f"[INFO] モデル変換完了: {mlx_output_dir}")
+                return str(mlx_output_dir)
+            
+            except Exception as e:
+                print(f"[ERROR] モデル変換中にエラーが発生しました: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise
+        
+        except Exception as e:
+            print(f"[ERROR] Hugging Faceモデルの変換に失敗しました: {str(e)}")
+            sys.exit(1)
+    
     def load_model(self, model_name: str) -> bool:
         """指定されたモデルをロードする"""
         # すでに同じモデルがロードされている場合はスキップ
@@ -126,6 +318,15 @@ class MLXProcessor:
             return True
         
         try:
+            # モデルがMLX-LM形式かどうかを確認
+            is_mlx = self._is_mlx_format(model_name)
+            
+            # MLX-LM形式でない場合は変換
+            if not is_mlx:
+                print(f"[INFO] '{model_name}' はMLX-LM形式ではありません。Hugging Face形式と判断します。")
+                # 変換（対話的に量子化オプションを選択）
+                model_name = self._convert_hf_to_mlx(model_name)
+            
             print(f"モデル '{model_name}' をロード中...")
             
             # トークナイザーの設定パラメータを準備
@@ -367,6 +568,31 @@ class MLXProcessor:
         
         return results
     
+    def _cleanup_temp_models(self, keep_current=True):
+        """一時的に変換したモデルを削除する"""
+        # keep_converted_modelsオプションを確認
+        if self.script_settings.get("keep_converted_models", False):
+            print("[INFO] 変換されたモデルを保持します。")
+            return
+        
+        if not self.temp_dir.exists():
+            return
+            
+        try:
+            print("[INFO] 一時的な変換モデルを削除しています...")
+            current_model = self.current_model_name
+            
+            for model_dir in self.temp_dir.iterdir():
+                # 現在使用中のモデルはスキップ（オプション）
+                if keep_current and str(model_dir) == current_model:
+                    continue
+                    
+                if model_dir.is_dir():
+                    print(f"[INFO] 削除中: {model_dir}")
+                    shutil.rmtree(model_dir)
+        except Exception as e:
+            print(f"[警告] 一時モデルの削除中にエラーが発生しました: {e}")
+    
     def run(self, model_name: str, input_path: str, output_path: str) -> None:
         """メイン処理を実行する"""
         # モデルをロード
@@ -390,20 +616,31 @@ class MLXProcessor:
         # 結果を保存
         print(f"結果を {output_path} に保存しています...")
         self.write_jsonl(output_path, results)
+        
+        # 一時モデルをクリーンアップ
+        self._cleanup_temp_models()
+        
         print("処理が完了しました！")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MLX-LMを使用して入力テキストを処理するスクリプト')
+    parser = argparse.ArgumentParser(description='MLX-LMを使用して入力テキストを処理するスクリプト (Hugging Face対応)')
     parser.add_argument('--model', type=str, required=True, help='使用するモデル名またはHugging Faceリポジトリ')
     parser.add_argument('--input', type=str, required=True, help='入力JSONLファイルのパス')
     parser.add_argument('--output', type=str, required=True, help='出力JSONLファイルのパス')
     parser.add_argument('--config', type=str, default='template_config.json', help='設定ファイルのパス（デフォルト: template_config.json）')
+    parser.add_argument('--keep-converted', action='store_true', help='変換したモデルを保持する (デフォルト: 処理後に削除)')
     
     args = parser.parse_args()
     
-    # プロセッサを初期化して実行
+    # プロセッサを初期化
     processor = MLXProcessor(args.config)
+    
+    # keep-convertedオプションを設定に反映
+    if args.keep_converted:
+        processor.script_settings["keep_converted_models"] = True
+    
+    # 実行
     processor.run(args.model, args.input, args.output)
 
 
