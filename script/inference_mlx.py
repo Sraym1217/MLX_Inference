@@ -127,6 +127,10 @@ class MLXProcessor:
     
     def _is_mlx_format(self, model_path: str) -> bool:
         """モデルがMLX-LM形式かどうかを判定する"""
+        # パスが"mlx"で始まる場合はMLX-LM形式と判定
+        if model_path.startswith("mlx"):
+            return True
+            
         model_dir = Path(model_path)
         
         # ローカルパスでない場合はHugging Faceリポジトリとみなす
